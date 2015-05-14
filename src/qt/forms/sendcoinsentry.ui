@@ -76,7 +76,7 @@
         <string>The address to send the payment to (e.g. JgZaH1DdikpMTYc2x1Xb6eFBkKGibjmPb9)</string>
        </property>
        <property name="maxLength">
-        <number>34</number>
+        <number>80</number>
        </property>
       </widget>
      </item>

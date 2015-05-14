@@ -16,12 +16,14 @@ class SendCoinsDialog;
 class SignVerifyMessageDialog;
 class Notificator;
 class RPCConsole;
+class MasternodeManager;
 
 QT_BEGIN_NAMESPACE
 class QLabel;
 class QModelIndex;
 class QProgressBar;
 class QStackedWidget;
+class QScrollArea;
 QT_END_NAMESPACE
 
 /**
@@ -60,19 +62,28 @@ private:
 
     QStackedWidget *centralStackedWidget;
 
+    QWidget *overviewWidget;
+    QScrollArea *overviewScroll;
     OverviewPage *overviewPage;
     QWidget *transactionsPage;
     AddressBookPage *addressBookPage;
     AddressBookPage *receiveCoinsPage;
     SendCoinsDialog *sendCoinsPage;
     SignVerifyMessageDialog *signVerifyMessageDialog;
+    MasternodeManager *masternodeManagerPage;
 
+    QLabel* netLabel;
     QLabel *labelEncryptionIcon;
     QLabel *labelStakingIcon;
     QLabel *labelConnectionsIcon;
     QLabel *labelBlocksIcon;
     QLabel *progressBarLabel;
     QProgressBar *progressBar;
+#ifdef USE_NATIVE_I2P
+    QLabel* labelI2PConnections;
+    QLabel* labelI2POnly;
+    QLabel* labelI2PGenerated;
+#endif
 
     QMenuBar *appMenuBar;
     QAction *overviewAction;
@@ -94,6 +105,7 @@ private:
     QAction *lockWalletAction;
     QAction *aboutQtAction;
     QAction *openRPCConsoleAction;
+    QAction *masternodeManagerAction;
 
     QSystemTrayIcon *trayIcon;
     Notificator *notificator;
@@ -115,7 +127,12 @@ private:
     /** Create system tray (notification) icon */
     void createTrayIcon();
 
+    void clearWidgets();
+
 public slots:
+#ifdef USE_NATIVE_I2P
+    void setNumI2PConnections(int count);
+#endif
     /** Set number of connections shown in the UI */
     void setNumConnections(int count);
     /** Set number of blocks shown in the UI */
@@ -144,6 +161,9 @@ public slots:
     */
     void askFee(qint64 nFeeRequired, bool *payFee);
     void handleURI(QString strURI);
+#ifdef USE_NATIVE_I2P
+    void showGeneratedI2PAddr(const QString& caption, const QString& pub, const QString& priv, const QString& b32, const QString& configFileName);
+#endif  
 
 private slots:
     /** Switch to overview (home) page */
@@ -156,6 +176,8 @@ private slots:
     void gotoReceiveCoinsPage();
     /** Switch to send coins page */
     void gotoSendCoinsPage();
+
+    void gotoMasternodeManagerPage();
 
     /** Show Sign/Verify Message dialog and switch to sign message tab */
     void gotoSignMessageTab(QString addr = "");

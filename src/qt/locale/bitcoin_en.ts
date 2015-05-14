@@ -15,11 +15,9 @@
     </message>
     <message>
         <location line="+41"/>
-        <source>Copyright © 2009-2015 The Bitcoin developers
-Copyright © 2011-2012 PPCoin Developers
+        <source>Copyright © 2009-2014 The Bitcoin developers
 Copyright © 2012-2014 The NovaCoin developers
-Copyright © 2014-2015 The BlackCoin developers
-Copyright © 2015 The StakeCoin developers</source>
+Copyright © 2014 The BlackCoin developers</source>
         <translation type="unfinished"></translation>
     </message>
     <message>

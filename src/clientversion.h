@@ -19,4 +19,9 @@
 #define STRINGIZE(X) DO_STRINGIZE(X)
 #define DO_STRINGIZE(X) #X
 
+#ifdef USE_NATIVE_I2P 
+#define I2P_NATIVE_VERSION_MAJOR       0
+#define I2P_NATIVE_VERSION_MINOR       2
+#endif
+
 #endif // CLIENTVERSION_H

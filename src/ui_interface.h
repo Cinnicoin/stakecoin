@@ -16,6 +16,7 @@
 class CBasicKeyStore;
 class CWallet;
 class uint256;
+class CAdrenalineNodeConfig;
 
 /** General change type (added, updated, removed). */
 enum ChangeType
@@ -79,6 +80,12 @@ public:
     /** Handle a URL passed at the command line. */
     boost::signals2::signal<void (const std::string& strURI)> ThreadSafeHandleURI;
 
+#ifdef USE_NATIVE_I2P
+   boost::signals2::signal<void (const std::string& caption, const std::string& pub, const std::string& priv, const std::string& b32, const std::string& configFileName)> ThreadSafeShowGeneratedI2PAddress;
+
+   boost::signals2::signal<void (int newNumI2PConnections)> NotifyNumI2PConnectionsChanged;
+#endif
+
     /** Progress message during initialization. */
     boost::signals2::signal<void (const std::string &message)> InitMessage;
 
@@ -93,6 +100,8 @@ public:
      * @note called with lock cs_mapAlerts held.
      */
     boost::signals2::signal<void (const uint256 &hash, ChangeType status)> NotifyAlertChanged;
+
+    boost::signals2::signal<void (CAdrenalineNodeConfig nodeConfig)> NotifyAdrenalineNodeChanged;
 };
 
 extern CClientUIInterface uiInterface;

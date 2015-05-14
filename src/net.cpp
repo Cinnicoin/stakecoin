@@ -3,12 +3,20 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include "init.h"
+#include "irc.h"
 #include "chainparams.h"
 #include "db.h"
 #include "net.h"
 #include "main.h"
 #include "addrman.h"
 #include "ui_interface.h"
+#include "darksend.h"
+#include "wallet.h"
+
+#ifdef USE_NATIVE_I2P
+#include "i2p.h"
+#endif
 
 #ifdef WIN32
 #include <string.h>
@@ -27,7 +35,7 @@
 using namespace std;
 using namespace boost;
 
-static const int MAX_OUTBOUND_CONNECTIONS = 16;
+static const int MAX_OUTBOUND_CONNECTIONS = 32;
 
 bool OpenNetworkConnection(const CAddress& addrConnect, CSemaphoreGrant *grantOutbound = NULL, const char *strDest = NULL, bool fOneShot = false);
 
@@ -41,7 +49,11 @@ struct LocalServiceInfo {
 // Global state variables
 //
 bool fDiscover = true;
+#ifdef USE_NATIVE_I2P
+uint64_t nLocalServices = NODE_I2P | NODE_NETWORK;
+#else
 uint64_t nLocalServices = NODE_NETWORK;
+#endif
 static CCriticalSection cs_mapLocalHost;
 static map<CNetAddr, LocalServiceInfo> mapLocalHost;
 static bool vfReachable[NET_MAX] = {};
@@ -51,6 +63,11 @@ static CNode* pnodeSync = NULL;
 uint64_t nLocalHostNonce = 0;
 static std::vector<SOCKET> vhListenSocket;
 CAddrMan addrman;
+
+#ifdef USE_NATIVE_I2P
+static std::vector<SOCKET> vhI2PListenSocket;
+int nI2PNodeCount = 0;
+#endif
 
 vector<CNode*> vNodes;
 CCriticalSection cs_vNodes;
@@ -67,6 +84,9 @@ CCriticalSection cs_setservAddNodeAddresses;
 
 vector<std::string> vAddedNodes;
 CCriticalSection cs_vAddedNodes;
+
+NodeId nLastNodeId = 0;
+CCriticalSection cs_nLastNodeId;
 
 static CSemaphore *semOutbound = NULL;
 
@@ -130,10 +150,13 @@ CAddress GetLocalAddress(const CNetAddr *paddrPeer)
 bool RecvLine(SOCKET hSocket, string& strLine)
 {
     strLine = "";
-    while (true)
+    while (!ShutdownRequested())
     {
         char c;
-        int nBytes = recv(hSocket, &c, 1, 0);
+        int nBytes = recv(hSocket, &c, 1, MSG_DONTWAIT);
+	if(ShutdownRequested())
+	    return false;
+
         if (nBytes > 0)
         {
             if (c == '\n')
@@ -175,6 +198,7 @@ bool RecvLine(SOCKET hSocket, string& strLine)
             }
         }
     }
+    return false;
 }
 
 int GetnScore(const CService& addr)
@@ -344,7 +368,7 @@ CNode* FindNode(const CService& addr)
     return NULL;
 }
 
-CNode* ConnectNode(CAddress addrConnect, const char *pszDest)
+CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool darkSendMaster)
 {
     if (pszDest == NULL) {
         if (IsLocal(addrConnect))
@@ -354,6 +378,9 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest)
         CNode* pnode = FindNode((CService)addrConnect);
         if (pnode)
         {
+	    if(darkSendMaster)
+                pnode->fDarkSendMaster = true;
+
             pnode->AddRef();
             return pnode;
         }
@@ -367,7 +394,9 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest)
 
     // Connect
     SOCKET hSocket;
-    if (pszDest ? ConnectSocketByName(addrConnect, hSocket, pszDest, Params().GetDefaultPort()) : ConnectSocket(addrConnect, hSocket))
+    bool proxyConnectionFailed = false;
+    if (pszDest ? ConnectSocketByName(addrConnect, hSocket, pszDest, Params().GetDefaultPort(), nConnectTimeout, &proxyConnectionFailed) :
+                  ConnectSocket(addrConnect, hSocket, nConnectTimeout, &proxyConnectionFailed))
     {
         addrman.Attempt(addrConnect);
 
@@ -390,15 +419,21 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest)
         {
             LOCK(cs_vNodes);
             vNodes.push_back(pnode);
+#ifdef USE_NATIVE_I2P
+            if (addrConnect.IsNativeI2P())
+                ++nI2PNodeCount;
+#endif
         }
 
         pnode->nTimeConnected = GetTime();
         return pnode;
+    } else if (!proxyConnectionFailed) {
+        // If connecting to the node failed, and failure is not caused by a problem connecting to
+        // the proxy, mark this as an attempt.
+        addrman.Attempt(addrConnect);
     }
-    else
-    {
-        return NULL;
-    }
+
+    return NULL;
 }
 
 void CNode::CloseSocketDisconnect()
@@ -490,12 +525,14 @@ bool CNode::Misbehaving(int howmuch)
 #define X(name) stats.name = name
 void CNode::copyStats(CNodeStats &stats)
 {
+    stats.nodeid = this->GetId();
     X(nServices);
     X(nLastSend);
     X(nLastRecv);
     X(nTimeConnected);
     X(addrName);
     X(nVersion);
+    X(cleanSubVer);
     X(strSubVer);
     X(fInbound);
     X(nStartingHeight);
@@ -532,8 +569,12 @@ bool CNode::ReceiveMsgBytes(const char *pch, unsigned int nBytes)
         // get current incomplete message, or create a new one
         if (vRecvMsg.empty() ||
             vRecvMsg.back().complete())
+#ifdef USE_NATIVE_I2P
+            vRecvMsg.push_back(CNetMessage(nRecvStreamType, nRecvVersion));
+#else
             vRecvMsg.push_back(CNetMessage(SER_NETWORK, nRecvVersion));
-
+#endif
+            
         CNetMessage& msg = vRecvMsg.back();
 
         // absorb network data
@@ -555,6 +596,52 @@ bool CNode::ReceiveMsgBytes(const char *pch, unsigned int nBytes)
 
     return true;
 }
+
+#ifdef USE_NATIVE_I2P
+void AddIncomingConnection(SOCKET hSocket, const CAddress& addr)
+{
+    int nInbound = 0;
+
+    {
+        LOCK(cs_vNodes);
+        BOOST_FOREACH(CNode* pnode, vNodes)
+            if (pnode->fInbound)
+                nInbound++;
+    }
+
+    if (hSocket == INVALID_SOCKET)
+    {
+        int nErr = WSAGetLastError();
+        if (nErr != WSAEWOULDBLOCK)
+            printf("socket error accept failed: %d\n", nErr);
+    }
+    else if (nInbound >= GetArg("-maxconnections", 125) - MAX_OUTBOUND_CONNECTIONS)
+    {
+        {
+            LOCK(cs_setservAddNodeAddresses);
+            if (!setservAddNodeAddresses.count(addr))
+                closesocket(hSocket);
+        }
+    }
+    else if (CNode::IsBanned(addr))
+    {
+        printf("connection from %s dropped (banned)\n", addr.ToString().c_str());
+        closesocket(hSocket);
+    }
+    else
+    {
+        printf("accepted connection %s\n", addr.ToString().c_str());
+        CNode* pnode = new CNode(hSocket, addr, "", true);
+        pnode->AddRef();
+        {
+            LOCK(cs_vNodes);
+            vNodes.push_back(pnode);
+            ++nI2PNodeCount;
+        }
+    }
+}
+
+#endif
 
 int CNetMessage::readHeader(const char *pch, unsigned int nBytes)
 {
@@ -660,7 +747,9 @@ static list<CNode*> vNodesDisconnected;
 void ThreadSocketHandler()
 {
     unsigned int nPrevNodeCount = 0;
-
+#ifdef USE_NATIVE_I2P
+    int nPrevI2PNodeCount = 0;
+#endif
     while (true)
     {
         //
@@ -688,6 +777,10 @@ void ThreadSocketHandler()
                     if (pnode->fNetworkNode || pnode->fInbound)
                         pnode->Release();
                     vNodesDisconnected.push_back(pnode);
+#ifdef USE_NATIVE_I2P
+                    if (pnode->addr.IsNativeI2P())
+                        --nI2PNodeCount;
+#endif
                 }
             }
         }
@@ -725,7 +818,13 @@ void ThreadSocketHandler()
             nPrevNodeCount = vNodes.size();
             uiInterface.NotifyNumConnectionsChanged(nPrevNodeCount);
         }
-
+#ifdef USE_NATIVE_I2P
+        if (nPrevI2PNodeCount != nI2PNodeCount)
+        {
+            nPrevI2PNodeCount = nI2PNodeCount;
+            uiInterface.NotifyNumI2PConnectionsChanged(nI2PNodeCount);
+        }
+#endif
 
         //
         // Find which sockets have data to receive
@@ -742,6 +841,17 @@ void ThreadSocketHandler()
         FD_ZERO(&fdsetError);
         SOCKET hSocketMax = 0;
         bool have_fds = false;
+
+#ifdef USE_NATIVE_I2P
+        BOOST_FOREACH(SOCKET hI2PListenSocket, vhI2PListenSocket) {
+            if (hI2PListenSocket != INVALID_SOCKET)
+            {
+                FD_SET(hI2PListenSocket, &fdsetRecv);
+                hSocketMax = max(hSocketMax, hI2PListenSocket);
+                have_fds = true;
+            }
+        }
+#endif
 
         BOOST_FOREACH(SOCKET hListenSocket, vhListenSocket) {
             FD_SET(hListenSocket, &fdsetRecv);
@@ -839,6 +949,73 @@ void ThreadSocketHandler()
             }
         }
 
+#ifdef USE_NATIVE_I2P
+        //
+        // Accept new I2P connections
+        //
+
+        bool haveInvalids = false;
+        for (std::vector<SOCKET>::iterator it = vhI2PListenSocket.begin(); it != vhI2PListenSocket.end(); ++it)
+        {
+            SOCKET& hI2PListenSocket = *it;
+            if (hI2PListenSocket == INVALID_SOCKET)
+            {
+                if (haveInvalids)
+                    it = vhI2PListenSocket.erase(it) - 1;
+                else
+                    BindListenNativeI2P(hI2PListenSocket);
+                haveInvalids = true;
+            }
+            else if (FD_ISSET(hI2PListenSocket, &fdsetRecv))
+            {
+                const size_t bufSize = NATIVE_I2P_DESTINATION_SIZE + 1;
+                char pchBuf[bufSize];
+                memset(pchBuf, 0, bufSize);
+                int nBytes = recv(hI2PListenSocket, pchBuf, sizeof(pchBuf), MSG_DONTWAIT);
+                if (nBytes > 0)
+                {
+                    if (nBytes == NATIVE_I2P_DESTINATION_SIZE + 1) // we're waiting for dest-hash + '\n' symbol
+                    {
+                        std::string incomingAddr(pchBuf, pchBuf + NATIVE_I2P_DESTINATION_SIZE);
+                        CAddress addr;
+                        if (addr.SetSpecial(incomingAddr) && addr.IsNativeI2P())
+                        {
+                            AddIncomingConnection(hI2PListenSocket, addr);
+                        }
+                        else
+                        {
+                            printf("Invalid incoming destination hash received (%s)\n", incomingAddr.c_str());
+                            closesocket(hI2PListenSocket);
+                        }
+                    }
+                    else
+                    {
+                        printf("Invalid incoming destination hash size received (%d)\n", nBytes);
+                        closesocket(hI2PListenSocket);
+                    }
+                }
+                else if (nBytes == 0)
+                {
+                    // socket closed gracefully
+                    printf("I2P listen socket closed\n");
+                    closesocket(hI2PListenSocket);
+                }
+                else if (nBytes < 0)
+                {
+                    // error
+                    const int nErr = WSAGetLastError();
+                    if (nErr == WSAEWOULDBLOCK || nErr == WSAEMSGSIZE || nErr == WSAEINTR || nErr == WSAEINPROGRESS)
+                        continue;
+
+                    printf("I2P listen socket recv error %d\n", nErr);
+                    closesocket(hI2PListenSocket);
+                }
+                hI2PListenSocket = INVALID_SOCKET;  // we've saved this socket in a CNode or closed it, so we can safety reset it anyway
+                BindListenNativeI2P(hI2PListenSocket);
+            }
+        }
+
+#endif
 
         //
         // Service each socket
@@ -1001,10 +1178,12 @@ void ThreadMapPort()
             }
         }
 
-        string strDesc = "StakeCoin " + FormatFullVersion();
+        string strDesc = "Stakecoin " + FormatFullVersion();
 
         try {
-          while (true) {
+          while (!ShutdownRequested()) {
+		boost::this_thread::interruption_point();
+
 #ifndef UPNPDISCOVER_SUCCESS
                 /* miniupnpc 1.5 */
                 r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype,
@@ -1241,7 +1420,11 @@ void ThreadOpenConnections()
                 continue;
 
             // do not allow non-default ports, unless after 50 invalid addresses selected already
+#ifdef USE_NATIVE_I2P
+            if (!addr.IsNativeI2P() && addr.GetPort() != Params().GetDefaultPort() && nTries < 50)
+#else
             if (addr.GetPort() != Params().GetDefaultPort() && nTries < 50)
+#endif
                 continue;
 
             addrConnect = addr;
@@ -1465,7 +1648,48 @@ void ThreadMessageHandler()
 }
 
 
+#ifdef USE_NATIVE_I2P
+bool BindListenNativeI2P()
+{
+    SOCKET hNewI2PListenSocket = INVALID_SOCKET;
+    if (!BindListenNativeI2P(hNewI2PListenSocket))
+        return false;
+    vhI2PListenSocket.push_back(hNewI2PListenSocket);
+    return true;
+}
 
+bool BindListenNativeI2P(SOCKET& hSocket)
+{
+    hSocket = I2PSession::Instance().accept(false);
+    if (!SetSocketOptions(hSocket) || hSocket == INVALID_SOCKET)
+        return false;
+    CService addrBind(I2PSession::Instance().getMyDestination().pub, 0);
+    if (addrBind.IsRoutable() && fDiscover)
+        AddLocal(addrBind, LOCAL_BIND);
+    return true;
+}
+
+bool IsI2POnly()
+{
+//    bool i2pOnly = false;
+//    if (mapArgs.count("-onlynet"))
+//    {
+//        const std::vector<std::string>& onlyNets = mapMultiArgs["-onlynet"];
+//        i2pOnly = (onlyNets.size() == 1 && onlyNets[0] == NATIVE_I2P_NET_STRING);
+//    }
+//    return i2pOnly;
+
+    bool i2pOnly = NET_MAX > 0; // if NET_MAX == 0 we set i2pOnly to false and exit
+    for (int n = 0; n < NET_MAX; n++)
+    {
+        Network net = (Network)n;
+        if (net == NET_UNROUTABLE)
+            continue;
+        i2pOnly &= ((net == NET_NATIVE_I2P) != IsLimited(net)); // isI2P xor IsLimited
+    }
+    return i2pOnly;
+}
+#endif
 
 
 
@@ -1550,7 +1774,7 @@ bool BindListenPort(const CService &addrBind, string& strError)
     {
         int nErr = WSAGetLastError();
         if (nErr == WSAEADDRINUSE)
-            strError = strprintf(_("Unable to bind to %s on this computer. StakeCoin is probably already running."), addrBind.ToString());
+            strError = strprintf(_("Unable to bind to %s on this computer. Stakecoin is probably already running."), addrBind.ToString());
         else
             strError = strprintf(_("Unable to bind to %s on this computer (bind returned error %d, %s)"), addrBind.ToString(), nErr, strerror(nErr));
         LogPrintf("%s\n", strError);
@@ -1652,6 +1876,9 @@ void StartNode(boost::thread_group& threadGroup)
     MapPort(GetBoolArg("-upnp", USE_UPNP));
 #endif
 
+    // Get addresses from IRC and advertise ours
+    threadGroup.create_thread(boost::bind(&TraceThread<void (*)()>, "irc", &ThreadIRCSeed));
+
     // Send and receive from sockets, accept connections
     threadGroup.create_thread(boost::bind(&TraceThread<void (*)()>, "net", &ThreadSocketHandler));
 
@@ -1697,6 +1924,13 @@ public:
                 if (closesocket(hListenSocket) == SOCKET_ERROR)
                     LogPrintf("closesocket(hListenSocket) failed with error %d\n", WSAGetLastError());
 
+#ifdef USE_NATIVE_I2P
+        BOOST_FOREACH(SOCKET& hI2PListenSocket, vhI2PListenSocket)
+            if (hI2PListenSocket != INVALID_SOCKET)
+                if (closesocket(hI2PListenSocket) == SOCKET_ERROR)
+                    printf("closesocket(hI2PListenSocket) failed with error %d\n", WSAGetLastError());
+#endif
+
 #ifdef WIN32
         // Shutdown Windows Sockets
         WSACleanup();
@@ -1732,6 +1966,102 @@ void RelayTransaction(const CTransaction& tx, const uint256& hash, const CDataSt
 
     RelayInventory(inv);
 }
+
+void RelayTransactionLockReq(const CTransaction& tx, const uint256& hash, bool relayToAll)
+{
+    CInv inv(MSG_TXLOCK_REQUEST, tx.GetHash());
+
+    //broadcast the new lock
+    LOCK(cs_vNodes);
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        if(!relayToAll && !pnode->fRelayTxes)
+            continue;
+
+        pnode->PushMessage("txlreq", tx);
+    }
+
+}
+
+void RelayDarkSendFinalTransaction(const int sessionID, const CTransaction& txNew)
+{
+    LOCK(cs_vNodes);
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        pnode->PushMessage("dsf", sessionID, txNew);
+    }
+}
+
+void RelayDarkSendIn(const std::vector<CTxIn>& in, const int64_t& nAmount, const CTransaction& txCollateral, const std::vector<CTxOut>& out)
+{
+    LOCK(cs_vNodes);
+
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        if((CNetAddr)darkSendPool.submittedToMasternode != (CNetAddr)pnode->addr) continue;
+        LogPrintf("RelayDarkSendIn - found master, relaying message - %s \n", pnode->addr.ToString().c_str());
+        pnode->PushMessage("dsi", in, nAmount, txCollateral, out);
+    }
+}
+
+void RelayDarkSendStatus(const int sessionID, const int newState, const int newEntriesCount, const int newAccepted, const std::string error)
+{
+    LOCK(cs_vNodes);
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        pnode->PushMessage("dssu", sessionID, newState, newEntriesCount, newAccepted, error);
+    }
+}
+
+void RelayDarkSendElectionEntry(const CTxIn vin, const CService addr, const std::vector<unsigned char> vchSig, const int64_t nNow, const CPubKey pubkey, const CPubKey pubkey2, const int count, const int current, const int64_t lastUpdated, const int protocolVersion)
+{
+    LOCK(cs_vNodes);
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        if(!pnode->fRelayTxes) continue;
+
+        pnode->PushMessage("dsee", vin, addr, vchSig, nNow, pubkey, pubkey2, count, current, lastUpdated, protocolVersion);
+    }
+}
+
+void SendDarkSendElectionEntry(const CTxIn vin, const CService addr, const std::vector<unsigned char> vchSig, const int64_t nNow, const CPubKey pubkey, const CPubKey pubkey2, const int count, const int current, const int64_t lastUpdated, const int protocolVersion)
+{
+    LOCK(cs_vNodes);
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        pnode->PushMessage("dsee", vin, addr, vchSig, nNow, pubkey, pubkey2, count, current, lastUpdated, protocolVersion);
+    }
+}
+
+void RelayDarkSendElectionEntryPing(const CTxIn vin, const std::vector<unsigned char> vchSig, const int64_t nNow, const bool stop)
+{
+    LOCK(cs_vNodes);
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        if(!pnode->fRelayTxes) continue;
+
+        pnode->PushMessage("dseep", vin, vchSig, nNow, stop);
+    }
+}
+
+void SendDarkSendElectionEntryPing(const CTxIn vin, const std::vector<unsigned char> vchSig, const int64_t nNow, const bool stop)
+{
+    LOCK(cs_vNodes);
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        pnode->PushMessage("dseep", vin, vchSig, nNow, stop);
+    }
+}
+
+void RelayDarkSendCompletedTransaction(const int sessionID, const bool error, const std::string errorMessage)
+{
+    LOCK(cs_vNodes);
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        pnode->PushMessage("dsc", sessionID, error, errorMessage);
+    }
+}
+
 
 void CNode::RecordBytesRecv(uint64_t bytes)
 {
